@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.64](https://github.com/xubinlife/AionCore/compare/0.1.63...v0.1.64) (2026-08-11)
+
+
+### Bug Fixes
+
+* **cli-version:** deliver the version-drift notice, and stop it reading as an error ([#817](https://github.com/xubinlife/AionCore/issues/817)) ([c0e9e9d](https://github.com/xubinlife/AionCore/commit/c0e9e9d44572a588e3ad79b6ac435fbe53f71b99))
+
 ## [0.1.63](https://github.com/iOfficeAI/AionCore/compare/v0.1.62...v0.1.63) (2026-08-10)
 
 

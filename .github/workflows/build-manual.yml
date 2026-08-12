@@ -30,9 +30,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
+  # cross commit used by Linux builds.
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
-  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
+  LINUX_X64_GLIBC_MAX: "GLIBC_2.31"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
 
 jobs:
@@ -53,7 +53,7 @@ jobs:
           MACOS_X64='{"platform":"macos-x64","os":"macos-latest","target":"x86_64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-x64","use_cross":false}'
           WINDOWS_X64='{"platform":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-x64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
           WINDOWS_ARM64='{"platform":"windows-arm64","os":"windows-latest","target":"aarch64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-arm64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
-          LINUX_X64='{"platform":"linux-x64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-x64","use_cross":false}'
+          LINUX_X64='{"platform":"linux-x64","os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-x64","use_cross":true}'
           LINUX_ARM64='{"platform":"linux-arm64","os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-arm64","use_cross":true}'
 
           if [ "$PLATFORM" = "all" ]; then
@@ -110,7 +110,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.target == 'aarch64-unknown-linux-gnu' && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Verify pinned Linux ARM64 cross image is available
         if: matrix.target == 'aarch64-unknown-linux-gnu'

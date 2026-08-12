@@ -1,3 +1,8 @@
+[target.x86_64-unknown-linux-gnu]
+# Pin the stable cross image so Linux x64 release builds keep the
+# GLIBC 2.31 baseline required by Ubuntu 20.04 / Debian 11.
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
+
 [target.aarch64-unknown-linux-gnu]
 # Match the cross image digest used by v0.1.39/v0.1.40 Linux ARM64 releases.
 # This prevents cross main image updates from raising the GLIBC baseline again.

@@ -5,7 +5,7 @@
     "platform": "custom",
     "name": "计算平台模型服务",
     "base_url": "https://server-v3.computingplatform.com/api/v1/openai/v1",
-    "models": ["qwen3.6-35b-a3b-fp8"],
+    "models": ["qwen3.8-27b"],
     "enabled": true,
     "is_full_url": false
   },
@@ -20,6 +20,6 @@
   },
   "assistant": {
     "id": "computing-platform-assistant",
-    "default_model": "qwen3.6-35b-a3b-fp8"
+    "default_model": "qwen3.8-27b"
   }
 }

@@ -10,6 +10,21 @@
 /// discovery (handshake-filled open sets)" — these fields are the DISCOVERY
 /// half: which Commands a backend accepts, which input blocks, which models/
 /// modes it advertises, which auth methods (§0.5 panel).
+/// When an accepted mode switch starts governing tool approvals. See
+/// [`Capabilities::mode_switch_effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeSwitchEffect {
+    /// In force for the very next approval decision, even mid-turn.
+    ///
+    /// The default: a backend that reconfigures synchronously (aionrs mutates the shared
+    /// approval mode in-process) or writes straight to a live agent needs no ceremony,
+    /// and this keeps existing backends reporting what they already reported.
+    #[default]
+    Immediate,
+    /// The in-flight turn keeps the old mode; the switch governs from the next turn.
+    NextTurn,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capabilities {
     /// Parse tier: Parsed (full-field, e.g. claude) / Hook (lifecycle hooks
@@ -72,6 +87,32 @@ pub struct Capabilities {
     /// it — a dead button (MX-QUEUE-3). `can_queue` MUST read this bit, never
     /// `caps.steer`. Default false; only claude sets it true.
     pub accepts_proactive_input: bool,
+    /// Whether a message written while a turn is IN FLIGHT reaches the agent
+    /// without waiting for that turn to end.
+    ///
+    /// ⚠️ DELIBERATELY SEPARATE from `accepts_proactive_input`, whose meaning
+    /// varies by backend: agy sets it true merely to keep the input box usable
+    /// (one process per turn — it ignores stdin mid-turn), while claude sets it
+    /// true because a mid-turn write is genuinely consumed. Gating any UI
+    /// affordance on `accepts_proactive_input` would light a mid-turn control on
+    /// agy that it cannot honour (the MX-QUEUE-3 dead button).
+    ///
+    /// This bit is the ONLY one the wire and the frontend may read. Default
+    /// false so a newly integrated backend behaves like ACP until proven.
+    pub supports_midturn_delivery: bool,
+    /// When a mode switch this backend ACCEPTS starts governing tool approvals.
+    ///
+    /// Reported per call rather than statically, because the same backend answers
+    /// differently depending on what it is doing: claude writes a `set_permission_mode`
+    /// straight to stdin while idle, but QUEUES one raised mid-turn until the next
+    /// prompt. codex is `NextTurn` unconditionally — its schema says so
+    /// ("Override the approval policy for subsequent turns",
+    /// samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json).
+    ///
+    /// Consumed by `set_config_option` to decide between `Observed` and
+    /// `PendingNextTurn`; without it the response was self-fulfilling (cache the request
+    /// as an override, read it straight back, report success).
+    pub mode_switch_effect: ModeSwitchEffect,
     /// NEW (#101): user-invokable slash commands the backend advertises (claude
     /// `control_request{initialize}` response `commands[]`; ACP `session/update`
     /// `available_commands_update`; incl. MCP/plugin/skill-derived). Open set,
@@ -211,4 +252,55 @@ pub struct SignalSet {
     /// unchanged. P0's only backend (claude) = true (always emits result);
     /// the false branch has no fixture (recorded as a 04 residual).
     pub terminal_result: bool,
+}
+
+/// Backend-STATIC view of [`Capabilities::supports_midturn_delivery`], keyed by
+/// the runtime backend identifier (the `extra.backend` / assistant
+/// `runtime_backend` string the conversation layer persists and the session
+/// factories dispatch on).
+///
+/// The bit is a property of the backend TYPE, not of any live session: claude
+/// and codex are the direct-CLI backends whose mid-turn write genuinely reaches
+/// the agent; antigravity, aionrs, and every ACP agent are one-prompt-at-a-time.
+/// Consumers use this when no live `SessionBackend` exists (fresh or dormant
+/// conversations) so the reported capability cannot flap with agent liveness.
+/// Unknown/empty identifiers are conservatively `false` (ACP-like until proven,
+/// same default as `Capabilities`). Locked against the real capability
+/// constructors by tests below and module-local asserts in each backend.
+pub fn backend_supports_midturn_delivery(backend: &str) -> bool {
+    matches!(backend, "claude" | "codex")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midturn_delivery_is_opt_in_and_antigravity_is_excluded() {
+        // Default MUST be false: a new backend is ACP-like until proven otherwise.
+        assert!(!Capabilities::default().supports_midturn_delivery);
+    }
+
+    /// The static per-backend table must never drift from the bit the real
+    /// capability constructors declare. (claude has no pub constructor — its
+    /// lock lives module-local in `adapter::claude` tests.)
+    #[test]
+    fn static_backend_table_matches_capability_constructors() {
+        assert_eq!(
+            backend_supports_midturn_delivery("codex"),
+            crate::backend::codex_capabilities().supports_midturn_delivery,
+        );
+        assert_eq!(
+            backend_supports_midturn_delivery("antigravity"),
+            crate::backend::antigravity_capabilities().supports_midturn_delivery,
+        );
+        // Any ACP agent id (open set) falls through to the ACP connection's bit.
+        assert_eq!(
+            backend_supports_midturn_delivery("gemini"),
+            crate::backend::acp_capabilities().supports_midturn_delivery,
+        );
+        // Unknown/empty backends are conservatively false.
+        assert!(!backend_supports_midturn_delivery(""));
+        assert!(!backend_supports_midturn_delivery("aionrs"));
+    }
 }

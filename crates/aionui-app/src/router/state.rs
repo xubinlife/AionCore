@@ -49,6 +49,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -262,12 +263,7 @@ pub async fn build_module_states(
     .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
-    let backend_binary_path = Arc::new(
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("aioncore")),
-    );
+    let backend_binary_path = services.backend_binary_path();
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: backend binary path resolved"
@@ -396,6 +392,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         },
         services.data_dir.clone(),
     ));
+    service.with_event_broadcaster(services.event_bus.clone());
     AssistantRouterState { service }
 }
 
@@ -677,11 +674,82 @@ pub async fn build_channel_state(
     (state, components)
 }
 
+/// Backlog of assistant MCP binding changes held between the event bus and the
+/// team service. Bounded on purpose: the payload is tiny and a deep queue would
+/// only delay work that a single trailing reconcile subsumes anyway.
+const ASSISTANT_MCP_EVENT_QUEUE_SIZE: usize = 64;
+
+/// Bridge `assistant.mcpBindingChanged` from the shared event bus into the team
+/// service.
+///
+/// Two tasks rather than one on purpose. The receive loop must stay cheap: the
+/// bus is shared with every streaming WebSocket event and has a bounded backlog,
+/// so a slow consumer is dropped (`Lagged`) rather than waited for. Applying a
+/// binding change is NOT cheap — it re-resolves MCP against the database and can
+/// restart a runtime — so it runs on a separate worker and the receive loop only
+/// forwards. A `Lagged` gap means binding events were silently discarded, which
+/// would leave members on a stale MCP set; it is repaired by asking for a full
+/// reconcile instead of being ignored.
+fn spawn_assistant_mcp_binding_watcher(
+    mut event_rx: tokio::sync::broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
+    service: Arc<TeamSessionService>,
+) {
+    enum McpBindingWork {
+        Changed(aionui_api_types::AssistantMcpBindingChanged),
+        ReconcileAll,
+    }
+
+    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<McpBindingWork>(ASSISTANT_MCP_EVENT_QUEUE_SIZE);
+
+    tokio::spawn(async move {
+        while let Some(work) = work_rx.recv().await {
+            match work {
+                McpBindingWork::Changed(payload) => service.handle_assistant_mcp_binding_changed(payload).await,
+                McpBindingWork::ReconcileAll => service.reconcile_all_assistant_mcp_bindings().await,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        loop {
+            let work = match event_rx.recv().await {
+                Ok(event) if event.name == aionui_api_types::ASSISTANT_MCP_BINDING_CHANGED_EVENT => {
+                    match serde_json::from_value::<aionui_api_types::AssistantMcpBindingChanged>(event.data) {
+                        Ok(payload) => McpBindingWork::Changed(payload),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "invalid assistant MCP binding event");
+                            continue;
+                        }
+                    }
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "assistant MCP binding watcher lagged; reconciling every active session"
+                    );
+                    McpBindingWork::ReconcileAll
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            // A full queue means the worker is already behind on the same kind of
+            // work; a trailing reconcile will cover whatever we drop here, so
+            // degrade to that rather than blocking the bus receiver.
+            if work_tx.try_send(work).is_err() {
+                tracing::warn!("assistant MCP binding queue is full; requesting a full reconcile");
+                if work_tx.send(McpBindingWork::ReconcileAll).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Build the default `TeamRouterState` from application services.
 ///
-/// `backend_binary_path` is resolved once in `build_module_states` via
-/// `std::env::current_exe()` and cloned into each builder that needs it,
-/// per `docs/teams/phase1/interface-contracts.md` §10.
+/// `backend_binary_path` is resolved once while constructing `AppServices` and
+/// cloned into each builder that needs it, per
+/// `docs/teams/phase1/interface-contracts.md` §10.
 pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
@@ -742,6 +810,9 @@ pub fn build_team_state(
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
+    let capability_port: Arc<dyn aionui_team::TeamToolCapabilityPort> = Arc::new(TeamCapabilityResolver::new(
+        Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+    ));
     let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
@@ -758,9 +829,11 @@ pub fn build_team_state(
         turn_port,
         cancellation_port,
         slash_command_port,
+        capability_port,
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    spawn_assistant_mcp_binding_watcher(services.event_bus.subscribe(), Arc::clone(&service));
     service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,

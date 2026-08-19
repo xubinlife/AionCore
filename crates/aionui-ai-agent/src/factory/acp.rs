@@ -12,7 +12,7 @@ use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
-use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -28,7 +28,7 @@ use crate::runtime_status::conversation_runtime_reporter;
 /// talks: the frontend renders every non-aionrs agent through the ACP chat
 /// surface, so the backend label is the only thing that says which runtime a
 /// row really needs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendRoute {
     /// claude/codex — direct-CLI via `build_session_instance`.
     DirectCli,
@@ -38,12 +38,25 @@ pub(crate) enum BackendRoute {
     AcpManager,
 }
 
+const CONFIGURED_NON_ACP_ROUTES: &[(&str, BackendRoute)] = &[
+    ("antigravity", BackendRoute::Antigravity),
+    ("claude", BackendRoute::DirectCli),
+    ("codex", BackendRoute::DirectCli),
+];
+
+fn configured_non_acp_routes() -> &'static [(&'static str, BackendRoute)] {
+    CONFIGURED_NON_ACP_ROUTES
+}
+
 pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
-    match backend {
-        Some("antigravity") => BackendRoute::Antigravity,
-        Some("claude" | "codex") => BackendRoute::DirectCli,
-        _ => BackendRoute::AcpManager,
-    }
+    backend
+        .and_then(|backend| {
+            configured_non_acp_routes()
+                .iter()
+                .find(|(registered, _)| *registered == backend)
+                .map(|(_, route)| *route)
+        })
+        .unwrap_or(BackendRoute::AcpManager)
 }
 
 pub(super) async fn build(
@@ -193,6 +206,15 @@ pub(super) async fn build(
     };
     let mut session_mcp_servers = user_mcp_servers;
     for server in &config.session_mcp_servers {
+        // Reserved name defense: the team coordination MCP must win.
+        if server.name == TEAM_MCP_SERVER_NAME {
+            warn!(
+                ctx.conversation_id,
+                server_name = %server.name,
+                "session_mcp: reserved team MCP name in snapshot; skipping"
+            );
+            continue;
+        }
         if !session_server_supported_by_capabilities(server, &mcp_capabilities) {
             warn!(
                 ctx.conversation_id,
@@ -391,7 +413,10 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        // `aionui-team` is the reserved team coordination MCP name; a user row
+        // that collides with it is never injected here (the team bridge is
+        // folded in separately and must win).
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -1114,6 +1139,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_user_mcp_servers_skips_reserved_team_name() {
+        let stdio_config = stdio_config_for_existing_command();
+        let caps = AcpMcpCapabilities {
+            stdio: true,
+            http: true,
+            sse: true,
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
+            rows: vec![
+                make_row("user-enabled", "stdio", &stdio_config, true, false),
+                // A user row colliding with the team coordination MCP name must
+                // never be injected: the team bridge must win.
+                make_row(TEAM_MCP_SERVER_NAME, "stdio", &stdio_config, true, false),
+            ],
+            fail: false,
+        });
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    #[tokio::test]
     async fn load_user_mcp_servers_returns_empty_on_repo_failure() {
         let caps = AcpMcpCapabilities {
             stdio: true,
@@ -1213,6 +1263,37 @@ mod tests {
     fn claude_and_codex_keep_the_direct_cli_route() {
         assert_eq!(route_for_backend(Some("claude")), BackendRoute::DirectCli);
         assert_eq!(route_for_backend(Some("codex")), BackendRoute::DirectCli);
+    }
+
+    #[test]
+    fn every_registered_direct_descriptor_has_a_non_acp_factory_route() {
+        for descriptor in aionui_session::backend_capability_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.origin == aionui_common::CapabilityOrigin::DirectDescriptor)
+        {
+            assert_ne!(
+                route_for_backend(Some(descriptor.backend_id)),
+                BackendRoute::AcpManager,
+                "direct backend {} has a capability descriptor but no direct factory route; register its runtime before declaring the descriptor",
+                descriptor.backend_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_acp_factory_route_has_a_direct_descriptor() {
+        for (backend, _) in configured_non_acp_routes() {
+            let descriptor = aionui_session::backend_capability_descriptor(backend).unwrap_or_else(|| {
+                panic!(
+                    "direct factory backend {backend} has no capability descriptor; register its verified capabilities before routing it outside ACP"
+                )
+            });
+            assert_eq!(
+                descriptor.origin,
+                aionui_common::CapabilityOrigin::DirectDescriptor,
+                "non-ACP factory backend {backend} must use a direct capability descriptor"
+            );
+        }
     }
 
     #[test]

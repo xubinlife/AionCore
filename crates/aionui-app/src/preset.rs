@@ -80,7 +80,7 @@ async fn ensure_provider(services: &AppServices, config: &PresetConfiguration) -
         return Ok(());
     }
 
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let encrypted_empty_key = encrypt_string("", &encryption_key).context("encrypt preset provider empty api key")?;
     let models = serde_json::to_string(&config.provider.models)?;
 

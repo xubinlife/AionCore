@@ -74,6 +74,8 @@ impl ChannelMessageService {
         let req = SendMessageRequest {
             content: text.to_owned(),
             files: vec![],
+            // Channel traffic has no `@@` picker, so never any session refs.
+            sessions: vec![],
             inject_skills: vec![],
             hidden: false,
         };
@@ -564,6 +566,7 @@ mod tests {
             args: serde_json::Value::Null,
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         });

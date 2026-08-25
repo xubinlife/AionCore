@@ -529,12 +529,27 @@ impl SessionAgentTask {
     /// attachments by the backend's declared prompt blocks — capable media
     /// becomes native Image/Audio blocks; everything else keeps the
     /// pre-multimodal form (path in the [[AION_FILES]] text + resource link).
-    /// A read failure degrades that attachment back to a resource link — the
-    /// path also remains in the original text because partition already ran,
+    ///
+    /// A native media block carries ONLY bytes: `ContentBlock::Image` is
+    /// `{data, media_type}` with no path field, and `partition_media` has
+    /// already stripped that path out of the [[AION_FILES]] text. So each
+    /// natively-delivered attachment is PAIRED with a resource link to the very
+    /// same file — the adapters render a link as an `[Attached file: <uri>]`
+    /// text element (see `adapter/claude.rs` / `backend/codex_conn.rs`), which
+    /// is how every non-media attachment already travels and how images
+    /// travelled before the multimodal split. Without the pair, an agent that
+    /// can both see and read files gets pixels it cannot open (Sentry
+    /// 7677917218). The pair is gated on the backend advertising `resource`:
+    /// an un-advertised block is rejected at dispatch and would kill the whole
+    /// Send (`BlockSet::allows`).
+    ///
+    /// A read failure degrades that attachment back to a resource link alone —
+    /// the path also remains in the original text because partition already ran,
     /// which the adapters tolerate (they resolve links independently of the
     /// text). Shared by `send_message` and `deliver_midturn`.
     async fn build_prompt_blocks(&self, data: &SendMessageData) -> Vec<ContentBlock> {
         let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
+        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
         let mut content: Vec<ContentBlock> = Vec::new();
         if !partition.content.is_empty() {
             content.push(ContentBlock::Text(partition.content));
@@ -547,18 +562,30 @@ impl SessionAgentTask {
                 mime_type: None,
             });
         }
+        let mut media_links = 0usize;
         for attachment in &partition.media {
             match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => content.push(match attachment.kind {
-                    crate::media::MediaKind::Image => ContentBlock::Image {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                    crate::media::MediaKind::Audio => ContentBlock::Audio {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                }),
+                Some(bytes) => {
+                    content.push(match attachment.kind {
+                        crate::media::MediaKind::Image => ContentBlock::Image {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                        crate::media::MediaKind::Audio => ContentBlock::Audio {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                    });
+                    // Pair the bytes with the path (see the fn doc): the block
+                    // itself has no uri field and the text no longer lists it.
+                    if link_media_paths {
+                        content.push(ContentBlock::ResourceLink {
+                            uri: attachment.path.clone(),
+                            mime_type: Some(attachment.mime.clone()),
+                        });
+                        media_links += 1;
+                    }
+                }
                 None => content.push(ContentBlock::ResourceLink {
                     uri: attachment.path.clone(),
                     mime_type: Some(attachment.mime.clone()),
@@ -576,6 +603,7 @@ impl SessionAgentTask {
                 msg_id = %data.msg_id,
                 images,
                 audios,
+                media_links,
                 "session prompt carries native media content blocks"
             );
         }
@@ -1623,11 +1651,58 @@ fn spec_mode_model(
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
     let mode = resolved_session_mode(config, session_snapshot, metadata);
-    let model = session_snapshot
-        .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.current_model_id.clone())
-        .filter(|s| !s.is_empty());
+    // Same drop-if-not-in-catalog discipline the mode path applies: a persisted
+    // selection outlives the catalog it came from, and no backend validates a model id
+    // at spawn — claude in particular ACCEPTS a bogus id and only fails once the user
+    // sends a message (LIVE-PROBED 2.1.231: both `--model <bogus>` and
+    // `set_model{<bogus>}` echo the id into `system.init.model`, then the turn dies with
+    // `result{is_error:true}`). Dropping it here turns that into a silent fall back to
+    // the agent's default, which is the difference between "my old pick quietly stopped
+    // applying" and "every message errors".
+    let model = clear_stale_model(
+        metadata,
+        session_snapshot
+            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
+            .or_else(|| config.current_model_id.clone())
+            .filter(|s| !s.is_empty()),
+        conversation_id,
+    );
     (spec, mode, model)
+}
+
+/// Drop a model selection the agent's advertised catalog does not contain.
+///
+/// Pass-through when the catalog is absent or empty — that is the first-ever open of an
+/// agent (nothing handshaked yet), NOT evidence that the selection is invalid. Only a
+/// non-empty catalog that lacks the id is proof, and the id can legitimately go stale:
+/// the concrete rows depend on the user's `ANTHROPIC_DEFAULT_*` / provider env and on
+/// the CLI version, so an id stored months ago may simply no longer exist.
+fn clear_stale_model(
+    metadata: &aionui_api_types::AgentMetadata,
+    model: Option<String>,
+    conversation_id: &str,
+) -> Option<String> {
+    use crate::manager::acp::config_option_catalog::extract_models_from_value;
+    let model = model?;
+    let Some(catalog) = metadata
+        .handshake
+        .available_models
+        .as_ref()
+        .and_then(extract_models_from_value)
+    else {
+        return Some(model);
+    };
+    if catalog.available_models.is_empty() || catalog.available_models.iter().any(|entry| entry.model_id == model) {
+        return Some(model);
+    }
+    tracing::warn!(
+        conversation_id,
+        agent_id = %metadata.id,
+        requested_model = %model,
+        "persisted model selection is absent from the agent's catalog — falling back to \
+         the agent default for this session"
+    );
+    None
 }
 
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
@@ -2818,6 +2893,7 @@ fn spawn_event_pump(
                     input: None,
                     output: Some(acc.clone()),
                     description: None,
+                    parent_call_id: None,
                 }));
                 continue;
             }
@@ -3026,6 +3102,7 @@ fn spawn_event_pump(
                                     input: None,
                                     output: None,
                                     description: None,
+                                    parent_call_id: None,
                                 }));
                             }
                             tool_output.clear();
@@ -3158,6 +3235,7 @@ fn spawn_event_pump(
                             input: None,
                             output: None,
                             description: None,
+                            parent_call_id: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3786,11 +3864,19 @@ fn update_workflow_cards(
                         .and_then(|v| v.as_str())
                         .or_else(|| args.get("command").and_then(|v| v.as_str()))
                         .map(str::to_string);
-                    let mut card = WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms);
+                    // A Task subagent (`local_agent`) gets the "subagent" headline;
+                    // everything else (`local_bash`, unknown) stays "bg task".
+                    let is_agent = matches!(kind, Some(SubagentTaskKind::AgentContainer));
+                    let mut card = if is_agent {
+                        WorkflowCard::new_subagent(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    } else {
+                        WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    };
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
                         %call_id,
+                        subagent = is_agent,
                         "session-pump: background task card opened"
                     );
                     // No roster will ever arrive to trigger a first emission, so
@@ -3843,6 +3929,7 @@ fn update_workflow_cards(
                                 input: None,
                                 output: None,
                                 description: None,
+                                parent_call_id: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4112,6 +4199,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             tool_use_id,
             name,
             input,
+            parent_tool_use_id,
             ..
         } => {
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -4122,12 +4210,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: Some(input),
                 output: None,
                 description: None,
+                // Subagent attribution (009 H5): persisted onto the row so the
+                // frontend can group a subagent's steps under its Task call.
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::ToolResult {
             tool_use_id,
             is_error,
             content,
+            parent_tool_use_id,
             ..
         } => {
             let output = tool_result_text(&content);
@@ -4143,6 +4235,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: None,
                 output,
                 description: None,
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::TurnResult {
@@ -4962,6 +5055,71 @@ mod build_mapping_tests {
         assert_eq!(model.as_deref(), Some("claude-x"));
     }
 
+    // A catalog row carrying the persisted `{available_models:[{id,label}]}` shape the
+    // handshake write-back stores, for the stale-selection guard.
+    fn metadata_with_models(ids: &[&str]) -> aionui_api_types::AgentMetadata {
+        let mut md = test_metadata(Some("claude"), None);
+        md.handshake.available_models = Some(serde_json::json!({
+            "available_models": ids.iter().map(|id| serde_json::json!({"id": id, "label": id})).collect::<Vec<_>>(),
+            "current_model_id": ids.first().copied().unwrap_or_default(),
+        }));
+        md
+    }
+
+    /// A persisted selection the agent no longer advertises is DROPPED at build time,
+    /// so the session falls back to the agent default instead of failing on the user's
+    /// first message. No backend validates a model id at spawn — claude echoes a bogus
+    /// one into `system.init.model` and only dies at turn time (LIVE-PROBED 2.1.231 for
+    /// both `--model` and in-band `set_model`) — so this is the only guard that runs
+    /// before the user is affected.
+    #[test]
+    fn stale_model_selection_is_dropped_before_it_reaches_the_backend() {
+        let cfg = AcpBuildExtra {
+            // A concrete id that only existed under a previous ANTHROPIC_DEFAULT_* /
+            // provider env or CLI version.
+            current_model_id: Some("claude-opus-4-8[1m]".into()),
+            ..Default::default()
+        };
+        let md = metadata_with_models(&["default", "sonnet", "opus", "haiku"]);
+        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md);
+        assert_eq!(model, None, "an id absent from the catalog must not be sent");
+
+        // A selection the catalog DOES advertise survives untouched.
+        let live = AcpBuildExtra {
+            current_model_id: Some("haiku".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md);
+        assert_eq!(model.as_deref(), Some("haiku"));
+
+        // `default` is a real catalog row, so it survives here; suppressing it is the
+        // claude backend's job (`desired_model_from_config`), not this guard's.
+        let default_row = AcpBuildExtra {
+            current_model_id: Some("default".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md);
+        assert_eq!(model.as_deref(), Some("default"));
+    }
+
+    /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
+    /// invalid — dropping it there would break the very first session of every agent,
+    /// including codex/ACP backends that share this path.
+    #[test]
+    fn model_selection_passes_through_when_no_catalog_is_known_yet() {
+        let cfg = AcpBuildExtra {
+            current_model_id: Some("gpt-5.6-terra".into()),
+            ..Default::default()
+        };
+        // handshake.available_models = None
+        let (_spec, _mode, model) = spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "absent catalog ⇒ pass through");
+
+        // An EMPTY catalog is equally uninformative.
+        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "empty catalog ⇒ pass through");
+    }
+
     /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
     /// fork completed; the spec is lineage data); unbound + fork spec opens in
     /// Fork mode against the parent's snapshotted sid; unbound + no spec stays
@@ -5322,6 +5480,7 @@ mod translate_tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         })
     }
 
@@ -6681,8 +6840,8 @@ mod pump_tests {
     }
 
     // Image-capable backend: an image attachment leaves the [[AION_FILES]]
-    // text and rides as a native Image block; non-media files keep the
-    // path-text + resource-link form.
+    // text and rides as a native Image block PAIRED with a link to the same
+    // file; non-media files keep the path-text + resource-link form.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_message_partitions_image_into_native_block() {
         let dir = std::env::temp_dir().join("aionui-session-media-tests");
@@ -6730,7 +6889,11 @@ mod pump_tests {
         let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
             panic!("expected a Send command");
         };
-        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        assert_eq!(
+            content.len(),
+            4,
+            "text + pdf link + image block + the image's own link: {content:?}"
+        );
         let ContentBlock::Text(text) = &content[0] else {
             panic!("expected text first: {content:?}");
         };
@@ -6744,6 +6907,132 @@ mod pump_tests {
         };
         assert_eq!(data, b"catbytes");
         assert_eq!(media_type, "image/png");
+        let ContentBlock::ResourceLink { uri, mime_type } = &content[3] else {
+            panic!("expected the image's paired resource link fourth: {content:?}");
+        };
+        assert_eq!(uri, &img);
+        assert_eq!(mime_type.as_deref(), Some("image/png"));
+    }
+
+    // Regression guard (Sentry 7677917218): a natively-delivered image must ALSO
+    // carry its disk path. Without the paired link the agent sees pixels but has
+    // no path for its Read tool — it can look at the image but not open the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_pairs_image_block_with_resource_link() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("qr.png");
+        std::fs::write(&img, b"qrbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-link".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("replace the qr code\n\n{marker}\n{img}"),
+                msg_id: "m-link".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        let linked: Vec<&str> = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ResourceLink { uri, .. } => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            vec![img.as_str()],
+            "the image's path must ride along as a resource link: {content:?}"
+        );
+    }
+
+    // Capability gate: a backend that takes images but NOT resource links must not
+    // receive the paired link — `BlockSet::allows` rejects an un-advertised block
+    // and that rejection kills the WHOLE Send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_omits_media_link_when_resource_block_unsupported() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("no-link.png");
+        std::fs::write(&img, b"pngbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: false,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-nolink".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "look".into(),
+                msg_id: "m-nolink".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        assert!(
+            !content.iter().any(|b| matches!(b, ContentBlock::ResourceLink { .. })),
+            "must not emit a resource link to a backend that does not advertise it: {content:?}"
+        );
     }
 
     /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
@@ -7928,6 +8217,85 @@ mod pump_tests {
         assert!(
             settle > finish,
             "the card settles AFTER the turn's Finish — it survived the turn end"
+        );
+    }
+
+    /// A Task subagent (`task_type: local_agent`, kind `AgentContainer`) rides
+    /// the same card machinery as a background bash but must be LABELLED as a
+    /// subagent — with both saying "bg task" the step list could not tell
+    /// delegated agent work from a background shell (live 2026-08-19). Its
+    /// internal tool calls also carry the launching call's id so the frontend
+    /// can group them under the Task row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_subagent_card_is_labelled_subagent_and_children_carry_parent() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            // Shape mirrors claude_2.1.169_single_tool_turn.ndjson: Agent
+            // tool_use → task_started{local_agent} → the subagent's own tool_use
+            // frame carrying parent_tool_use_id.
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_task".into(),
+                name: "修复 AIONUI-151 桌面 401 恢复".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({
+                    "description": "修复 AIONUI-151 桌面 401 恢复",
+                    "subagent_type": "claude",
+                    "run_in_background": false
+                }),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: Some("claude".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_task".into()),
+                kind: Some(SubagentTaskKind::AgentContainer),
+            }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_inner".into(),
+                name: "Read httpBridge.ts".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"file_path": "/tmp/httpBridge.ts"}),
+                parent_tool_use_id: Some("toolu_task".into()),
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("toolu_task".into()),
+                kind: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+
+        let progress = wf_frames(&frames);
+        assert!(!progress.is_empty(), "the subagent card must emit on open");
+        let desc = progress[0].card.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("subagent ae859b22dc5afbdca"),
+            "a Task subagent's card says 'subagent', not 'bg task': {desc}"
+        );
+        assert!(!desc.contains("bg task"), "not a bg task: {desc}");
+
+        // Attribution: the subagent's INTERNAL call carries the Task call's id;
+        // the Task launch itself (a main-agent call) carries none.
+        let parent_of = |id: &str| {
+            frames.iter().find_map(|f| match f {
+                AgentStreamEvent::ToolCall(d) if d.call_id == id && d.status == ToolCallStatus::Running => {
+                    Some(d.parent_call_id.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            parent_of("toolu_inner"),
+            Some(Some("toolu_task".into())),
+            "a subagent-internal call must carry its Task call's id"
+        );
+        assert_eq!(
+            parent_of("toolu_task"),
+            Some(None),
+            "the main-agent launching call carries no parent"
         );
     }
 

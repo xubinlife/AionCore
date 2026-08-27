@@ -25,9 +25,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
+  # cross commit used by Linux release builds.
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
-  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
+  LINUX_X64_GLIBC_MAX: "GLIBC_2.31"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
@@ -57,18 +57,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64: build natively on ubuntu-22.04 (GLIBC 2.35) so the
-          # release binary runs on Debian 12 / Ubuntu 22.04+ / RHEL 9 /
-          # CentOS Stream 9. We cannot use `cross` here because the default
-          # cross docker image ships a gcc that aws-lc-sys's memcmp safety
-          # check rejects. Pinning the runner is simpler and covers the
-          # target audience — Debian 11 (GLIBC 2.31) is entering ELTS so we
-          # deliberately drop it.
-          - os: ubuntu-22.04
+          # Linux x86_64: use cross so the release binary stays within the
+          # GLIBC 2.31 baseline required by Ubuntu 20.04 / Debian 11.
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary_name: aioncore
-          # Linux aarch64: keep `cross` (its image happens to not trip the
-          # aws-lc-sys check and also yields an older GLIBC baseline).
+            use_cross: true
+          # Linux aarch64: keep `cross` (its image yields an older GLIBC baseline).
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             binary_name: aioncore
@@ -108,11 +103,9 @@ jobs:
         with:
           # Include runner OS image and cross baseline in the cache key.
           # Proc-macro .so files link against the host GLIBC, so switching
-          # the runner (ubuntu-24.04 ↔ 22.04) or flipping native ↔ cross
-          # must fall into a different cache bucket — otherwise the cached
-          # .so is loaded against an incompatible GLIBC and cargo panics
-          # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          # the runner or cross baseline must fall into a different cache
+          # bucket — otherwise cached artifacts may become incompatible.
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.target == 'aarch64-unknown-linux-gnu' && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Verify pinned Linux ARM64 cross image is available
         if: matrix.target == 'aarch64-unknown-linux-gnu'

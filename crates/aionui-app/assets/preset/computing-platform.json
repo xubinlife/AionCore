@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "provider": {
+    "id": "computing-platform",
+    "platform": "custom",
+    "name": "计算平台模型服务",
+    "base_url": "https://server-v3.computingplatform.com/api/v1/openai/v1",
+    "models": [
+      {
+        "id": "qwen3.8-27b",
+        "protocol": "openai",
+        "enabled": true
+      }
+    ],
+    "enabled": true,
+    "is_full_url": false
+  },
+  "mcp": {
+    "name": "computing-platform",
+    "description": "计算平台 MCP 服务，用于查询和操作任务、资源、数据集、模型、工单及用户上下文。",
+    "url": "https://mcp.computingplatform.com/mcp",
+    "enabled": false,
+    "headers": {
+      "Authorization": ""
+    }
+  },
+  "assistant": {
+    "id": "computing-platform-assistant",
+    "default_model": "qwen3.8-27b"
+  }
+}

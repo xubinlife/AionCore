@@ -1,0 +1,54 @@
+name: Publish AionCore v0.2.1
+
+on:
+  push:
+    branches:
+      - release-v0.2.1
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    name: Create v0.2.1 tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release branch
+        uses: actions/checkout@v6
+        with:
+          ref: release-v0.2.1
+          fetch-depth: 0
+
+      - name: Create and push release tag
+        shell: bash
+        env:
+          TAG: v0.2.1
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          remote_sha="$(git ls-remote origin "refs/tags/${TAG}" | awk '{print $1}')"
+
+          if [[ -n "${remote_sha}" ]]; then
+            if [[ "${remote_sha}" != "${head_sha}" ]]; then
+              echo "Tag ${TAG} already exists at ${remote_sha}, expected ${head_sha}" >&2
+              exit 1
+            fi
+            echo "Tag ${TAG} already points to ${head_sha}; nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${TAG}" "${head_sha}"
+          git push origin "refs/tags/${TAG}"
+
+  build-and-release:
+    name: Build and publish AionCore v0.2.1
+    needs: create-tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag_name: v0.2.1
+    secrets: inherit
